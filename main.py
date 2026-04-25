@@ -757,7 +757,7 @@ td.down { color: var(--red); }
         <span class="input-prefix">$</span>
         <input id="investment" type="number" min="1" step="any" placeholder="10000" autocomplete="off" inputmode="decimal"/>
       </div>
-      <button id="go-btn" onclick="runEstimate()">Update Estimate</button>
+      <button id="go-btn" onclick="runEstimate()">Estimate</button>
     </div>
     <div class="quick-amounts">
       <button class="qa-btn" onclick="setAmount(1000)">$1K</button>
@@ -887,7 +887,7 @@ async function runEstimate() {
     setStatus('Error', 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = 'Update Estimate';
+    btn.innerHTML = 'Estimate';
   }
 }
 
