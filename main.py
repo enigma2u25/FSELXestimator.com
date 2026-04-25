@@ -27,16 +27,16 @@ CACHE_TTL_HOURS = 24
 PRICE_CACHE_TTL_SECONDS = 60    # Re-fetch prices at most every 60s
 
 FALLBACK_HOLDINGS: Dict[str, float] = {
-    "NVDA": 0.18,
-    "AMD":  0.10,
-    "AVGO": 0.09,
-    "TSM":  0.08,
-    "ASML": 0.07,
-    "AMAT": 0.06,
-    "LRCX": 0.05,
-    "KLAC": 0.04,
-    "MU":   0.03,
-    "ADI":  0.03,
+    "NVDA": 0.2507,
+    "AVGO":  0.1294,
+    "MRVL": 0.1148,
+    "MPWR":  0.0571,
+    "NXPI": 0.0568,
+    "ON": 0.0476,
+    "GFS": 0.0430,
+    "LRCX": 0.0423,
+    "ASML":   0.0412,
+    "MU":  0.0402,
 }
 
 # ── In-memory cache ──────────────────────────────────────────────────────────
