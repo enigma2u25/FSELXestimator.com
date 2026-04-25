@@ -465,7 +465,7 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
 <title>FSELX · NAV Estimator</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700;900&display=swap" rel="stylesheet"/>
@@ -474,19 +474,19 @@ HTML = r"""<!DOCTYPE html>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:          #090b0f;
-  --surface:     #0d1117;
-  --surface2:    #121820;
-  --border:      #1e2a38;
-  --border2:     #243040;
-  --accent:      #00d4ff;
-  --accent2:     #0091cc;
-  --green:       #00e5a0;
-  --red:         #ff4560;
-  --amber:       #ffb800;
-  --text:        #e8f0f8;
-  --text-muted:  #5a7a9a;
-  --text-dim:    #3a5570;
+  --bg:          #ffffff;
+  --surface:     #f5f7f5;
+  --surface2:    #eaf2ec;
+  --border:      #d4e2d6;
+  --border2:     #b8cfbb;
+  --accent:      #00a650;
+  --accent2:     #007a3d;
+  --green:       #00a650;
+  --red:         #d0021b;
+  --amber:       #b85c00;
+  --text:        #1a2e1c;
+  --text-muted:  #4a6b4e;
+  --text-dim:    #8aab8e;
   --mono:        'Share Tech Mono', monospace;
   --display:     'Barlow Condensed', sans-serif;
 }
@@ -494,23 +494,14 @@ HTML = r"""<!DOCTYPE html>
 html { background: var(--bg); color: var(--text); font-family: var(--display); min-height: 100vh; }
 body { min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }
 
-/* ── Scanline overlay ─────────────────────────────────────────────── */
-body::before {
-  content: '';
-  position: fixed; inset: 0; z-index: 999; pointer-events: none;
-  background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,.06) 2px, rgba(0,0,0,.06) 4px);
-}
+/* ── Scanline overlay (removed for light theme) ───────────────────── */
 
-/* ── Animated grid background ─────────────────────────────────────── */
+/* ── Subtle dot grid background ───────────────────────────────────── */
 .grid-bg {
   position: fixed; inset: 0; z-index: 0; pointer-events: none;
-  background-image:
-    linear-gradient(rgba(0,212,255,.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(0,212,255,.03) 1px, transparent 1px);
-  background-size: 40px 40px;
-  animation: gridpan 60s linear infinite;
+  background-image: radial-gradient(circle, rgba(0,166,80,.12) 1px, transparent 1px);
+  background-size: 24px 24px;
 }
-@keyframes gridpan { from{background-position:0 0} to{background-position:40px 40px} }
 
 /* ── Layout ───────────────────────────────────────────────────────── */
 .wrapper {
@@ -527,8 +518,8 @@ header {
 }
 .fund-badge {
   font-family: var(--mono); font-size: 11px; letter-spacing: .2em;
-  color: var(--accent); background: rgba(0,212,255,.08);
-  border: 1px solid rgba(0,212,255,.25); border-radius: 3px;
+  color: var(--accent); background: rgba(0,166,80,.08);
+  border: 1px solid rgba(0,166,80,.3); border-radius: 3px;
   padding: 3px 10px; margin-bottom: 8px;
 }
 header h1 {
@@ -577,7 +568,7 @@ header h1 span { color: var(--accent); }
   background: var(--bg); overflow: hidden;
   transition: border-color .2s;
 }
-.input-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0,212,255,.12); }
+.input-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0,166,80,.15); }
 .input-prefix {
   position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
   font-family: var(--mono); font-size: 16px; color: var(--text-muted);
@@ -592,19 +583,18 @@ header h1 span { color: var(--accent); }
 
 button#go-btn {
   height: 52px; padding: 0 20px; border: none; border-radius: 5px; cursor: pointer;
-  background: var(--accent); color: var(--bg);
+  background: var(--accent); color: #ffffff;
   font-family: var(--display); font-size: 15px; font-weight: 700;
   letter-spacing: .06em; text-transform: uppercase; white-space: nowrap;
   transition: all .15s; position: relative; overflow: hidden;
 }
 button#go-btn::after {
   content: ''; position: absolute; inset: 0;
-  background: rgba(255,255,255,0); transition: background .15s;
+  background: rgba(0,0,0,0); transition: background .15s;
 }
-button#go-btn:hover::after { background: rgba(255,255,255,.12); }
+button#go-btn:hover::after { background: rgba(0,0,0,.1); }
 button#go-btn:active { transform: scale(.97); }
 button#go-btn:disabled { opacity: .5; cursor: not-allowed; }
-button#go-btn .btn-icon { margin-right: 4px; }
 
 /* ── Quick amounts ────────────────────────────────────────────────── */
 .quick-amounts {
@@ -616,7 +606,7 @@ button#go-btn .btn-icon { margin-right: 4px; }
   border-radius: 3px; color: var(--text-muted); cursor: pointer;
   transition: all .15s;
 }
-.qa-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,212,255,.06); }
+.qa-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(0,166,80,.07); }
 
 /* ── Results ──────────────────────────────────────────────────────── */
 #results { display: none; flex-direction: column; gap: 12px; }
@@ -645,9 +635,9 @@ button#go-btn .btn-icon { margin-right: 4px; }
   display: inline-flex; align-items: center; gap: 5px;
   padding: 3px 10px; border-radius: 3px; letter-spacing: .05em;
 }
-.nav-return.up   { background: rgba(0,229,160,.1); color: var(--green); }
-.nav-return.down { background: rgba(255,69,96,.1);  color: var(--red); }
-.nav-return.flat { background: rgba(255,184,0,.1);  color: var(--amber); }
+.nav-return.up   { background: rgba(0,166,80,.1);  color: var(--green); }
+.nav-return.down { background: rgba(208,2,27,.08); color: var(--red); }
+.nav-return.flat { background: rgba(184,92,0,.08); color: var(--amber); }
 
 /* ── Stats grid ───────────────────────────────────────────────────── */
 .stats-grid {
@@ -689,7 +679,7 @@ thead th {
 thead th:not(:first-child) { text-align: right; }
 tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
 tbody tr:last-child { border-bottom: none; }
-tbody tr:hover { background: rgba(255,255,255,.02); }
+tbody tr:hover { background: rgba(0,166,80,.04); }
 tbody td { font-family: var(--mono); font-size: 12px; padding: 9px 12px; color: var(--text); }
 tbody td:not(:first-child) { text-align: right; }
 td.ticker { font-weight: 600; color: var(--accent); letter-spacing: .05em; }
@@ -767,9 +757,7 @@ td.down { color: var(--red); }
         <span class="input-prefix">$</span>
         <input id="investment" type="number" min="1" step="any" placeholder="10000" autocomplete="off" inputmode="decimal"/>
       </div>
-      <button id="go-btn" onclick="runEstimate()">
-        <span class="btn-icon">⚡</span> Estimate
-      </button>
+      <button id="go-btn" onclick="runEstimate()">Update Estimate</button>
     </div>
     <div class="quick-amounts">
       <button class="qa-btn" onclick="setAmount(1000)">$1K</button>
@@ -899,7 +887,7 @@ async function runEstimate() {
     setStatus('Error', 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<span class="btn-icon">⚡</span> Estimate';
+    btn.innerHTML = 'Update Estimate';
   }
 }
 
