@@ -222,56 +222,102 @@ async def refresh_holdings_if_needed():
 def fetch_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
     """
     Returns {ticker: (prev_close, current_price)} for each ticker.
-    Uses yfinance. Skips tickers with missing data.
+    Works during market hours AND when market is closed (weekends/after-hours).
+    Strategy:
+      - Try 1-minute intraday bars (period=5d) for live session
+      - Fall back to daily bars (period=5d) when market is closed
     """
     results: Dict[str, Tuple[float, float]] = {}
+
+    def _parse_df(df, ticker):
+        """Extract (prev_close, current) from a dataframe."""
+        if df is None or df.empty:
+            return None
+        df = df.dropna(subset=["Close"])
+        if len(df) < 2:
+            return None
+
+        df.index = df.index.tz_convert("UTC")
+        today = datetime.now(timezone.utc).date()
+        today_rows = df[df.index.date == today]
+        prev_rows  = df[df.index.date < today]
+
+        if not today_rows.empty and not prev_rows.empty:
+            # Market is open — normal intraday case
+            prev_close = float(prev_rows["Close"].iloc[-1])
+            current    = float(today_rows["Close"].iloc[-1])
+        elif today_rows.empty and not prev_rows.empty:
+            # Market closed today (weekend / after-hours / holiday)
+            # Use last two available closing prices
+            days = sorted(set(prev_rows.index.date))
+            if len(days) < 2:
+                return None
+            day_n   = days[-1]   # most recent session
+            day_n1  = days[-2]   # session before that
+            prev_close = float(prev_rows[prev_rows.index.date == day_n1]["Close"].iloc[-1])
+            current    = float(prev_rows[prev_rows.index.date == day_n]["Close"].iloc[-1])
+        else:
+            # Fallback: just use last two rows
+            prev_close = float(df["Close"].iloc[-2])
+            current    = float(df["Close"].iloc[-1])
+
+        return (prev_close, current)
+
+    # ── Attempt 1: 1-minute intraday bars ────────────────────────────────────
     try:
         data = yf.download(
             tickers,
-            period="2d",
+            period="5d",
             interval="1m",
             group_by="ticker",
             auto_adjust=True,
             progress=False,
             threads=True,
         )
+        for ticker in tickers:
+            try:
+                df = data if len(tickers) == 1 else (
+                    data[ticker] if ticker in data.columns.get_level_values(0) else None
+                )
+                parsed = _parse_df(df, ticker)
+                if parsed:
+                    results[ticker] = parsed
+                else:
+                    log.warning("1m: no usable data for %s", ticker)
+            except Exception as e:
+                log.warning("1m parse error for %s: %s", ticker, e)
     except Exception as e:
-        log.error("yfinance batch download failed: %s", e)
-        return results
+        log.warning("1m download failed: %s", e)
 
-    for ticker in tickers:
+    # ── Attempt 2: daily bars for any tickers that failed ────────────────────
+    missing = [t for t in tickers if t not in results]
+    if missing:
+        log.info("Falling back to daily bars for: %s", missing)
         try:
-            if len(tickers) == 1:
-                df = data
-            else:
-                df = data[ticker] if ticker in data.columns.get_level_values(0) else None
-
-            if df is None or df.empty:
-                log.warning("No data for %s", ticker)
-                continue
-
-            df = df.dropna(subset=["Close"])
-            if len(df) < 2:
-                log.warning("Insufficient rows for %s", ticker)
-                continue
-
-            # Previous close = last row of previous trading day
-            today = datetime.now(timezone.utc).date()
-            df.index = df.index.tz_convert("UTC")
-            prev_rows = df[df.index.date < today]
-            today_rows = df[df.index.date == today]
-
-            if prev_rows.empty:
-                # Market just opened; use first two rows
-                prev_close = float(df["Close"].iloc[-2])
-                current = float(df["Close"].iloc[-1])
-            else:
-                prev_close = float(prev_rows["Close"].iloc[-1])
-                current = float(today_rows["Close"].iloc[-1]) if not today_rows.empty else prev_close
-
-            results[ticker] = (prev_close, current)
+            data_d = yf.download(
+                missing,
+                period="5d",
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            for ticker in missing:
+                try:
+                    df = data_d if len(missing) == 1 else (
+                        data_d[ticker] if ticker in data_d.columns.get_level_values(0) else None
+                    )
+                    parsed = _parse_df(df, ticker)
+                    if parsed:
+                        results[ticker] = parsed
+                        log.info("Daily fallback OK for %s: prev=%.2f cur=%.2f", ticker, *parsed)
+                    else:
+                        log.warning("Daily: no usable data for %s", ticker)
+                except Exception as e:
+                    log.warning("Daily parse error for %s: %s", ticker, e)
         except Exception as e:
-            log.warning("Price parse error for %s: %s", ticker, e)
+            log.error("Daily download failed: %s", e)
 
     return results
 
@@ -330,7 +376,11 @@ def calculate_nav(
         })
 
     if total_weight == 0:
-        raise ValueError("No valid price data — cannot compute NAV")
+        raise ValueError(
+            "No valid price data — if the market is closed, try again during "
+            "US market hours (Mon–Fri 9:30am–4pm ET). "
+            "Weekend estimates use the most recent two closing prices."
+        )
 
     adjusted_return = weighted_return / total_weight
     nav_est = prev_nav * (1 + adjusted_return)
