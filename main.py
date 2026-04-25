@@ -491,8 +491,8 @@ HTML = r"""<!DOCTYPE html>
   --display:     'Barlow Condensed', sans-serif;
 }
 
-html { background: var(--bg); color: var(--text); font-family: var(--display); min-height: 100vh; }
-body { min-height: 100vh; display: flex; flex-direction: column; overflow-x: hidden; }
+html { background: var(--bg); color: var(--text); font-family: var(--display); min-height: 100vh; width: 100%; overflow-x: hidden; }
+body { min-height: 100vh; width: 100%; display: flex; flex-direction: column; overflow-x: hidden; }
 
 /* ── Scanline overlay (removed for light theme) ───────────────────── */
 
@@ -506,8 +506,9 @@ body { min-height: 100vh; display: flex; flex-direction: column; overflow-x: hid
 /* ── Layout ───────────────────────────────────────────────────────── */
 .wrapper {
   position: relative; z-index: 1;
-  max-width: 540px; margin: 0 auto;
+  width: 100%; max-width: 540px; margin: 0 auto;
   padding: 20px 16px 60px;
+  box-sizing: border-box;
   display: flex; flex-direction: column; gap: 16px;
 }
 
@@ -656,10 +657,12 @@ button#go-btn:disabled { opacity: .5; cursor: not-allowed; }
 .holdings-card {
   background: var(--surface); border: 1px solid var(--border);
   border-radius: 8px; overflow: hidden;
+  width: 100%; max-width: 100%;
 }
 .holdings-header {
   padding: 12px 16px; border-bottom: 1px solid var(--border);
   display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 6px;
 }
 .holdings-title {
   font-size: 10px; font-weight: 600; letter-spacing: .18em; text-transform: uppercase; color: var(--text-muted);
@@ -670,7 +673,8 @@ button#go-btn:disabled { opacity: .5; cursor: not-allowed; }
   padding: 2px 6px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-table { width: 100%; border-collapse: collapse; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; width: 100%; }
+table { width: 100%; border-collapse: collapse; min-width: 340px; }
 thead th {
   font-family: var(--mono); font-size: 9px; letter-spacing: .12em; text-transform: uppercase;
   color: var(--text-dim); padding: 8px 12px; text-align: left;
@@ -726,8 +730,19 @@ td.down { color: var(--red); }
 }
 
 /* ── Responsive ───────────────────────────────────────────────────── */
+@media(max-width:480px){
+  .wrapper { padding: 14px 12px 48px; gap: 12px; }
+  .input-row { flex-wrap: nowrap; }
+  #investment { font-size: 18px; }
+  button#go-btn { font-size: 13px; padding: 0 14px; }
+  .nav-value { font-size: clamp(28px, 9vw, 42px); }
+  .stat-value { font-size: 17px; }
+  thead th, tbody td { padding: 7px 8px; font-size: 11px; }
+}
 @media(max-width:360px){
   .stats-grid { grid-template-columns: 1fr; }
+  .wrapper { padding: 12px 10px 40px; }
+  button#go-btn { font-size: 12px; padding: 0 10px; }
 }
 </style>
 </head>
@@ -757,7 +772,7 @@ td.down { color: var(--red); }
         <span class="input-prefix">$</span>
         <input id="investment" type="number" min="1" step="any" placeholder="10000" autocomplete="off" inputmode="decimal"/>
       </div>
-      <button id="go-btn" onclick="runEstimate()">Estimate</button>
+      <button id="go-btn" onclick="runEstimate()">Update Estimate</button>
     </div>
     <div class="quick-amounts">
       <button class="qa-btn" onclick="setAmount(1000)">$1K</button>
@@ -808,6 +823,7 @@ td.down { color: var(--red); }
         <span class="holdings-title">Top 10 Holdings · Live Weights</span>
         <span class="holdings-source" id="holdings-source-badge">—</span>
       </div>
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -820,6 +836,7 @@ td.down { color: var(--red); }
         </thead>
         <tbody id="holdings-tbody"></tbody>
       </table>
+      </div>
     </div>
 
     <div class="ts-footer" id="r-timestamp"></div>
@@ -887,7 +904,7 @@ async function runEstimate() {
     setStatus('Error', 'error');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = 'Estimate';
+    btn.innerHTML = 'Update Estimate';
   }
 }
 
