@@ -28,15 +28,15 @@ PRICE_CACHE_TTL_SECONDS = 60    # Re-fetch prices at most every 60s
 
 FALLBACK_HOLDINGS: Dict[str, float] = {
     "NVDA": 0.2507,
-    "AVGO":  0.1294,
+    "AVGO": 0.1294,
     "MRVL": 0.1148,
-    "MPWR":  0.0571,
+    "MPWR": 0.0571,
     "NXPI": 0.0568,
-    "ON": 0.0476,
-    "GFS": 0.0430,
+    "ON":   0.0476,
+    "GFS":  0.0430,
     "LRCX": 0.0423,
-    "ASML":   0.0412,
-    "MU":  0.0402,
+    "ASML": 0.0412,
+    "MU":   0.0402,
 }
 
 # ── In-memory cache ──────────────────────────────────────────────────────────
@@ -219,106 +219,103 @@ async def refresh_holdings_if_needed():
 # PRICE FETCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def fetch_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
+def _fetch_single_ticker(ticker: str) -> Optional[Tuple[float, float]]:
     """
-    Returns {ticker: (prev_close, current_price)} for each ticker.
-    Works during market hours AND when market is closed (weekends/after-hours).
-    Strategy:
-      - Try 1-minute intraday bars (period=5d) for live session
-      - Fall back to daily bars (period=5d) when market is closed
+    Fetch (prev_close, current_price) for one ticker.
+    Tries 1-minute intraday first, falls back to daily bars.
+    Returns None if all attempts fail.
     """
-    results: Dict[str, Tuple[float, float]] = {}
-
-    def _parse_df(df, ticker):
-        """Extract (prev_close, current) from a dataframe."""
+    def _extract(df):
+        """Pull (prev_close, current) from a history DataFrame."""
         if df is None or df.empty:
             return None
+        df = df.copy()
         df = df.dropna(subset=["Close"])
         if len(df) < 2:
             return None
 
-        df.index = df.index.tz_convert("UTC")
-        today = datetime.now(timezone.utc).date()
+        # Normalise timezone
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+
+        today     = datetime.now(timezone.utc).date()
         today_rows = df[df.index.date == today]
         prev_rows  = df[df.index.date < today]
 
         if not today_rows.empty and not prev_rows.empty:
-            # Market is open — normal intraday case
-            prev_close = float(prev_rows["Close"].iloc[-1])
-            current    = float(today_rows["Close"].iloc[-1])
-        elif today_rows.empty and not prev_rows.empty:
-            # Market closed today (weekend / after-hours / holiday)
-            # Use last two available closing prices
+            # Normal market-open case
+            return (float(prev_rows["Close"].iloc[-1]),
+                    float(today_rows["Close"].iloc[-1]))
+
+        if today_rows.empty and not prev_rows.empty:
+            # Market closed / pre-market: use last two trading sessions
             days = sorted(set(prev_rows.index.date))
             if len(days) < 2:
-                return None
-            day_n   = days[-1]   # most recent session
-            day_n1  = days[-2]   # session before that
-            prev_close = float(prev_rows[prev_rows.index.date == day_n1]["Close"].iloc[-1])
-            current    = float(prev_rows[prev_rows.index.date == day_n]["Close"].iloc[-1])
-        else:
-            # Fallback: just use last two rows
-            prev_close = float(df["Close"].iloc[-2])
-            current    = float(df["Close"].iloc[-1])
+                # Only one prior day available — use last two bars
+                return (float(df["Close"].iloc[-2]),
+                        float(df["Close"].iloc[-1]))
+            day_n  = days[-1]
+            day_n1 = days[-2]
+            c1 = prev_rows[prev_rows.index.date == day_n1]["Close"].iloc[-1]
+            c2 = prev_rows[prev_rows.index.date == day_n]["Close"].iloc[-1]
+            return (float(c1), float(c2))
 
-        return (prev_close, current)
+        # Catch-all: just use last two rows
+        return (float(df["Close"].iloc[-2]),
+                float(df["Close"].iloc[-1]))
 
-    # ── Attempt 1: 1-minute intraday bars ────────────────────────────────────
+    t = yf.Ticker(ticker)
+
+    # ── Attempt 1: 1-minute intraday (last 5 trading days) ───────────────────
     try:
-        data = yf.download(
-            tickers,
-            period="5d",
-            interval="1m",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        for ticker in tickers:
-            try:
-                df = data if len(tickers) == 1 else (
-                    data[ticker] if ticker in data.columns.get_level_values(0) else None
-                )
-                parsed = _parse_df(df, ticker)
-                if parsed:
-                    results[ticker] = parsed
-                else:
-                    log.warning("1m: no usable data for %s", ticker)
-            except Exception as e:
-                log.warning("1m parse error for %s: %s", ticker, e)
+        df = t.history(period="5d", interval="1m", auto_adjust=True, raise_errors=False)
+        result = _extract(df)
+        if result:
+            return result
+        log.warning("%s: 1m bars returned no usable data", ticker)
     except Exception as e:
-        log.warning("1m download failed: %s", e)
+        log.warning("%s: 1m fetch error — %s", ticker, e)
 
-    # ── Attempt 2: daily bars for any tickers that failed ────────────────────
-    missing = [t for t in tickers if t not in results]
-    if missing:
-        log.info("Falling back to daily bars for: %s", missing)
-        try:
-            data_d = yf.download(
-                missing,
-                period="5d",
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
-            for ticker in missing:
-                try:
-                    df = data_d if len(missing) == 1 else (
-                        data_d[ticker] if ticker in data_d.columns.get_level_values(0) else None
-                    )
-                    parsed = _parse_df(df, ticker)
-                    if parsed:
-                        results[ticker] = parsed
-                        log.info("Daily fallback OK for %s: prev=%.2f cur=%.2f", ticker, *parsed)
-                    else:
-                        log.warning("Daily: no usable data for %s", ticker)
-                except Exception as e:
-                    log.warning("Daily parse error for %s: %s", ticker, e)
-        except Exception as e:
-            log.error("Daily download failed: %s", e)
+    # ── Attempt 2: daily bars ─────────────────────────────────────────────────
+    try:
+        df = t.history(period="10d", interval="1d", auto_adjust=True, raise_errors=False)
+        result = _extract(df)
+        if result:
+            log.info("%s: using daily bar fallback", ticker)
+            return result
+        log.warning("%s: daily bars returned no usable data", ticker)
+    except Exception as e:
+        log.warning("%s: daily fetch error — %s", ticker, e)
 
+    return None
+
+
+def fetch_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
+    """
+    Fetch prices for all tickers in parallel using a thread pool.
+    Each ticker is fetched independently so one failure can't break others.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: Dict[str, Tuple[float, float]] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(tickers), 10)) as pool:
+        future_to_ticker = {pool.submit(_fetch_single_ticker, t): t for t in tickers}
+        for future in as_completed(future_to_ticker, timeout=30):
+            ticker = future_to_ticker[future]
+            try:
+                val = future.result()
+                if val:
+                    results[ticker] = val
+                    log.info("%s: prev=%.4f cur=%.4f", ticker, *val)
+                else:
+                    log.warning("%s: no price data returned", ticker)
+            except Exception as e:
+                log.warning("%s: unexpected error — %s", ticker, e)
+
+    log.info("Prices fetched: %d/%d tickers OK", len(results), len(tickers))
     return results
 
 
