@@ -23,7 +23,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-FSELX_PREV_NAV = 27.12          # Update this daily or fetch from Fidelity
+FSELX_NAV_FALLBACK = 57.86      # Used only if live NAV fetch fails
+NAV_CACHE_TTL_SECONDS = 4 * 3600   # Mutual funds price once/day at 4pm ET
 CACHE_TTL_HOURS = 24
 PRICE_CACHE_TTL_SECONDS = 60    # Re-fetch prices at most every 60s
 
@@ -47,6 +48,11 @@ holdings_timestamp: Optional[float] = None
 
 price_cache: Dict[str, Tuple[float, float]] = {}   # ticker → (prev_close, current)
 price_cache_ts: float = 0.0
+
+# FSELX previous NAV cache
+fselx_nav_cache: Optional[float] = None
+fselx_nav_source: str = "uninitialized"
+fselx_nav_ts: float = 0.0
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(title="FSELX NAV Estimator", version="1.0.0")
@@ -339,6 +345,93 @@ async def get_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FSELX NAV FETCH (live)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_fselx_nav_sync() -> Optional[Tuple[float, str]]:
+    """
+    Fetch the most recent published NAV for FSELX from Yahoo via yfinance.
+    Returns (nav, source_label) or None on failure.
+
+    Mutual funds publish one NAV per day at 4pm ET.
+      - Pre-4pm:  fast_info.last_price = yesterday's NAV  (= "previous NAV" we want)
+      - Post-4pm: fast_info.last_price = today's NAV      (= the "previous NAV" we use to estimate tomorrow's intraday)
+    Either way, last_price is the most recent published NAV — exactly what we want.
+    """
+    import math
+
+    def _ok(v):
+        if v is None: return False
+        try:
+            f = float(v)
+            return not math.isnan(f) and f > 0
+        except (TypeError, ValueError):
+            return False
+
+    # ── Method 1: fast_info ──────────────────────────────────────────────────
+    try:
+        t = yf.Ticker("FSELX")
+        fi = t.fast_info
+        nav = getattr(fi, "last_price", None)
+        if _ok(nav):
+            return float(nav), "Yahoo Finance (live)"
+
+        prev = getattr(fi, "regular_market_previous_close", None) or \
+               getattr(fi, "previous_close", None)
+        if _ok(prev):
+            return float(prev), "Yahoo Finance (previous_close)"
+    except Exception as e:
+        log.warning("FSELX fast_info error: %s", e)
+
+    # ── Method 2: daily-bar fallback ─────────────────────────────────────────
+    try:
+        df = yf.download("FSELX", period="5d", interval="1d",
+                         auto_adjust=True, progress=False)
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                closes = df.xs("Close", axis=1, level=0).iloc[:, 0]
+            else:
+                closes = df["Close"]
+            closes = closes.dropna()
+            if len(closes) >= 1 and _ok(closes.iloc[-1]):
+                return float(closes.iloc[-1]), "Yahoo Finance (daily bar)"
+    except Exception as e:
+        log.warning("FSELX download fallback error: %s", e)
+
+    return None
+
+
+async def get_fselx_prev_nav() -> Tuple[float, str]:
+    """
+    Returns (prev_nav, source_label). Cached for NAV_CACHE_TTL_SECONDS.
+    Falls back to FSELX_NAV_FALLBACK only if the live fetch fails the very first time.
+    """
+    global fselx_nav_cache, fselx_nav_source, fselx_nav_ts
+
+    now = time.time()
+    if fselx_nav_cache and (now - fselx_nav_ts) < NAV_CACHE_TTL_SECONDS:
+        return fselx_nav_cache, fselx_nav_source
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _fetch_fselx_nav_sync)
+
+    if result:
+        nav, src = result
+        fselx_nav_cache = nav
+        fselx_nav_source = src
+        fselx_nav_ts = now
+        log.info("✅ FSELX NAV refreshed: $%.4f from %s", nav, src)
+        return nav, src
+
+    if fselx_nav_cache:
+        log.warning("FSELX NAV refresh failed — using stale cache: $%.4f", fselx_nav_cache)
+        return fselx_nav_cache, fselx_nav_source + " (stale)"
+
+    log.warning("FSELX NAV fetch failed — using hardcoded fallback: $%.4f", FSELX_NAV_FALLBACK)
+    return FSELX_NAV_FALLBACK, "Fallback (hardcoded)"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # NAV CALCULATION
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -400,6 +493,8 @@ def calculate_nav(
 async def startup_event():
     log.info("🚀 FSELX NAV Estimator starting up…")
     await refresh_holdings_if_needed()
+    nav, src = await get_fselx_prev_nav()
+    log.info("Initial FSELX NAV: $%.4f (%s)", nav, src)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -430,6 +525,7 @@ async def diagnostics():
 
     loop = asyncio.get_event_loop()
     prices = await loop.run_in_executor(None, fetch_prices, tickers)
+    prev_nav, nav_source = await get_fselx_prev_nav()
 
     report = []
     for ticker in tickers:
@@ -447,6 +543,8 @@ async def diagnostics():
 
     return JSONResponse({
         "yfinance_version": yf.__version__,
+        "fselx_prev_nav": round(prev_nav, 4),
+        "fselx_nav_source": nav_source,
         "tickers_total": len(tickers),
         "tickers_ok": len(prices),
         "tickers_failed": len(tickers) - len(prices),
@@ -463,27 +561,32 @@ async def estimate(investment: float = Query(..., gt=0, description="Investment 
     if not holdings_cache:
         raise HTTPException(status_code=503, detail="Holdings data unavailable")
 
+    # Fetch live previous NAV in parallel with prices
     tickers = list(holdings_cache.keys())
     try:
+        prev_nav, nav_source = await get_fselx_prev_nav()
         prices = await get_prices(tickers)
     except Exception as e:
-        log.error("Price fetch error: %s", e)
-        raise HTTPException(status_code=502, detail=f"Price data unavailable: {e}")
+        log.error("Data fetch error: %s", e)
+        raise HTTPException(status_code=502, detail=f"Data unavailable: {e}")
 
     try:
-        nav_est, return_pct, details = calculate_nav(holdings_cache, prices, FSELX_PREV_NAV)
+        nav_est, return_pct, details = calculate_nav(holdings_cache, prices, prev_nav)
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    shares = investment / FSELX_PREV_NAV
+    shares = investment / prev_nav
     estimated_value = shares * nav_est
     dollar_gain = estimated_value - investment
 
     ts = datetime.fromtimestamp(holdings_timestamp, tz=timezone.utc).isoformat() if holdings_timestamp else None
+    nav_ts = datetime.fromtimestamp(fselx_nav_ts, tz=timezone.utc).isoformat() if fselx_nav_ts else None
 
     return JSONResponse({
         "fund": "FSELX",
-        "prev_nav": FSELX_PREV_NAV,
+        "prev_nav": round(prev_nav, 4),
+        "prev_nav_source": nav_source,
+        "prev_nav_last_updated": nav_ts,
         "estimated_nav": round(nav_est, 4),
         "return_pct": round(return_pct, 3),
         "investment": round(investment, 2),
