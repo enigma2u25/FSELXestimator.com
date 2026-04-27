@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
 import httpx
+import pandas as pd
 import yfinance as yf
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
@@ -222,80 +223,78 @@ async def refresh_holdings_if_needed():
 def _fetch_single_ticker(ticker: str) -> Optional[Tuple[float, float]]:
     """
     Fetch (prev_close, current_price) for one ticker.
-    Tries 1-minute intraday first, falls back to daily bars.
-    Returns None if all attempts fail.
+
+    Strategy (in order of preference):
+      1. fast_info — single quote API call, fastest & most reliable
+      2. yf.download daily bars — falls back to last 2 closing prices
+
+    Returns None only if both methods fail.
     """
-    def _extract(df):
-        """Pull (prev_close, current) from a history DataFrame."""
-        if df is None or df.empty:
-            return None
-        df = df.copy()
-        df = df.dropna(subset=["Close"])
-        if len(df) < 2:
-            return None
+    import math
 
-        # Normalise timezone
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
+    def _is_valid(*vals):
+        for v in vals:
+            if v is None:
+                return False
+            try:
+                f = float(v)
+                if math.isnan(f) or f <= 0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    # ── Method 1: fast_info (single quote API call) ──────────────────────────
+    try:
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
+
+        # fast_info exposes both attribute and dict-style access; try both.
+        prev = getattr(fi, "regular_market_previous_close", None) or \
+               getattr(fi, "previous_close", None)
+        cur  = getattr(fi, "last_price", None)
+
+        if _is_valid(prev, cur):
+            return (float(prev), float(cur))
         else:
-            df.index = df.index.tz_convert("UTC")
-
-        today     = datetime.now(timezone.utc).date()
-        today_rows = df[df.index.date == today]
-        prev_rows  = df[df.index.date < today]
-
-        if not today_rows.empty and not prev_rows.empty:
-            # Normal market-open case
-            return (float(prev_rows["Close"].iloc[-1]),
-                    float(today_rows["Close"].iloc[-1]))
-
-        if today_rows.empty and not prev_rows.empty:
-            # Market closed / pre-market: use last two trading sessions
-            days = sorted(set(prev_rows.index.date))
-            if len(days) < 2:
-                # Only one prior day available — use last two bars
-                return (float(df["Close"].iloc[-2]),
-                        float(df["Close"].iloc[-1]))
-            day_n  = days[-1]
-            day_n1 = days[-2]
-            c1 = prev_rows[prev_rows.index.date == day_n1]["Close"].iloc[-1]
-            c2 = prev_rows[prev_rows.index.date == day_n]["Close"].iloc[-1]
-            return (float(c1), float(c2))
-
-        # Catch-all: just use last two rows
-        return (float(df["Close"].iloc[-2]),
-                float(df["Close"].iloc[-1]))
-
-    t = yf.Ticker(ticker)
-
-    # ── Attempt 1: 1-minute intraday (last 5 trading days) ───────────────────
-    try:
-        df = t.history(period="5d", interval="1m", auto_adjust=True, raise_errors=False)
-        result = _extract(df)
-        if result:
-            return result
-        log.warning("%s: 1m bars returned no usable data", ticker)
+            log.warning("%s: fast_info returned invalid values prev=%s cur=%s",
+                        ticker, prev, cur)
     except Exception as e:
-        log.warning("%s: 1m fetch error — %s", ticker, e)
+        log.warning("%s: fast_info error — %s", ticker, e)
 
-    # ── Attempt 2: daily bars ─────────────────────────────────────────────────
+    # ── Method 2: yf.download daily bars (fallback) ──────────────────────────
     try:
-        df = t.history(period="10d", interval="1d", auto_adjust=True, raise_errors=False)
-        result = _extract(df)
-        if result:
-            log.info("%s: using daily bar fallback", ticker)
-            return result
-        log.warning("%s: daily bars returned no usable data", ticker)
+        df = yf.download(
+            ticker,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+        if df is not None and not df.empty:
+            # Handle both flat and multi-level column DataFrames
+            if isinstance(df.columns, pd.MultiIndex):
+                if ("Close", ticker) in df.columns:
+                    closes = df[("Close", ticker)]
+                else:
+                    closes = df.xs("Close", axis=1, level=0).iloc[:, 0]
+            else:
+                closes = df["Close"]
+
+            closes = closes.dropna()
+            if len(closes) >= 2 and _is_valid(closes.iloc[-2], closes.iloc[-1]):
+                log.info("%s: using daily-bar fallback", ticker)
+                return (float(closes.iloc[-2]), float(closes.iloc[-1]))
     except Exception as e:
-        log.warning("%s: daily fetch error — %s", ticker, e)
+        log.warning("%s: download fallback error — %s", ticker, e)
 
     return None
 
 
 def fetch_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
     """
-    Fetch prices for all tickers in parallel using a thread pool.
-    Each ticker is fetched independently so one failure can't break others.
+    Fetch all tickers in parallel using a thread pool.
+    One ticker's failure can't break the others.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -303,19 +302,24 @@ def fetch_prices(tickers: list) -> Dict[str, Tuple[float, float]]:
 
     with ThreadPoolExecutor(max_workers=min(len(tickers), 10)) as pool:
         future_to_ticker = {pool.submit(_fetch_single_ticker, t): t for t in tickers}
-        for future in as_completed(future_to_ticker, timeout=30):
-            ticker = future_to_ticker[future]
-            try:
-                val = future.result()
-                if val:
-                    results[ticker] = val
-                    log.info("%s: prev=%.4f cur=%.4f", ticker, *val)
-                else:
-                    log.warning("%s: no price data returned", ticker)
-            except Exception as e:
-                log.warning("%s: unexpected error — %s", ticker, e)
+        try:
+            for future in as_completed(future_to_ticker, timeout=25):
+                ticker = future_to_ticker[future]
+                try:
+                    val = future.result()
+                    if val:
+                        results[ticker] = val
+                        log.info("✅ %-5s prev=%.4f cur=%.4f Δ=%+.2f%%",
+                                 ticker, val[0], val[1],
+                                 100 * (val[1] - val[0]) / val[0])
+                    else:
+                        log.warning("❌ %s: no price data", ticker)
+                except Exception as e:
+                    log.warning("❌ %s: future error — %s", ticker, e)
+        except TimeoutError:
+            log.error("Price fetch timed out at 25s — partial results returned")
 
-    log.info("Prices fetched: %d/%d tickers OK", len(results), len(tickers))
+    log.info("Price fetch summary: %d/%d OK", len(results), len(tickers))
     return results
 
 
@@ -349,9 +353,11 @@ def calculate_nav(
     weighted_return = 0.0
     total_weight = 0.0
     details = []
+    missing = []
 
     for ticker, weight in holdings.items():
         if ticker not in prices:
+            missing.append(ticker)
             log.warning("Skipping %s — no price data", ticker)
             continue
 
@@ -374,9 +380,10 @@ def calculate_nav(
 
     if total_weight == 0:
         raise ValueError(
-            "No valid price data — if the market is closed, try again during "
-            "US market hours (Mon–Fri 9:30am–4pm ET). "
-            "Weekend estimates use the most recent two closing prices."
+            f"No valid price data for any of the {len(holdings)} tickers: "
+            f"{', '.join(holdings.keys())}. "
+            f"Yahoo Finance may be rate-limiting the server. "
+            f"Try /diagnostics for details."
         )
 
     adjusted_return = weighted_return / total_weight
@@ -409,6 +416,42 @@ async def get_holdings():
         "last_updated": ts,
         "holdings": {k: round(v * 100, 2) for k, v in holdings_cache.items()},
         "count": len(holdings_cache),
+    })
+
+
+@app.get("/diagnostics")
+async def diagnostics():
+    """Diagnose price-fetching health for each ticker."""
+    await refresh_holdings_if_needed()
+
+    tickers = list(holdings_cache.keys())
+    if not tickers:
+        return JSONResponse({"error": "no holdings loaded"}, status_code=503)
+
+    loop = asyncio.get_event_loop()
+    prices = await loop.run_in_executor(None, fetch_prices, tickers)
+
+    report = []
+    for ticker in tickers:
+        if ticker in prices:
+            prev, cur = prices[ticker]
+            report.append({
+                "ticker": ticker,
+                "status": "✅ OK",
+                "prev_close": round(prev, 4),
+                "current": round(cur, 4),
+                "return_pct": round(100 * (cur - prev) / prev, 3),
+            })
+        else:
+            report.append({"ticker": ticker, "status": "❌ FAILED", "prev_close": None, "current": None})
+
+    return JSONResponse({
+        "yfinance_version": yf.__version__,
+        "tickers_total": len(tickers),
+        "tickers_ok": len(prices),
+        "tickers_failed": len(tickers) - len(prices),
+        "report": report,
+        "as_of": datetime.now(timezone.utc).isoformat(),
     })
 
 
