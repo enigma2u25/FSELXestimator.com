@@ -6,9 +6,10 @@ Production-ready FastAPI app with live holdings scraping, fallback, and price da
 import asyncio
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 import pandas as pd
@@ -28,6 +29,84 @@ NAV_CACHE_TTL_SECONDS = 4 * 3600   # Mutual funds price once/day at 4pm ET
 CACHE_TTL_HOURS = 24
 PRICE_CACHE_TTL_SECONDS = 60    # Re-fetch prices at most every 60s
 
+# SEC EDGAR — N-PORT-P filing source (quarterly portfolio holdings, public ~60-day lag)
+# SEC fair-use policy requires a User-Agent with real contact info.
+# Override via Railway env var: SEC_USER_AGENT="YourApp your-email@example.com"
+SEC_USER_AGENT  = os.environ.get("SEC_USER_AGENT", "FSELX-NAV-Estimator contact@example.com")
+EDGAR_SEARCH    = "https://efts.sec.gov/LATEST/search-index"
+SEC_ARCHIVES    = "https://www.sec.gov/Archives/edgar/data"
+FSELX_SEARCH_Q  = '"Fidelity Select Semiconductors"'
+
+# Holdings cap — top N by weight kept for performance
+MAX_HOLDINGS = 30
+
+# ── Company name → ticker mapping ────────────────────────────────────────────
+# N-PORT XML uses legal names ("NVIDIA CORP"), not tickers.
+# Mapping covers the universe a semiconductor sector fund typically holds.
+NAME_TO_TICKER: Dict[str, str] = {
+    # ── Top FSELX semiconductor names ──
+    "NVIDIA CORP": "NVDA",
+    "BROADCOM INC": "AVGO",
+    "MARVELL TECHNOLOGY INC": "MRVL",
+    "MONOLITHIC POWER SYSTEMS INC": "MPWR",
+    "NXP SEMICONDUCTORS NV": "NXPI",
+    "ON SEMICONDUCTOR CORP": "ON",
+    "ONSEMI": "ON",
+    "GLOBALFOUNDRIES INC": "GFS",
+    "LAM RESEARCH CORP": "LRCX",
+    "ASML HOLDING NV": "ASML",
+    "ASML HOLDING N V": "ASML",
+    "MICRON TECHNOLOGY INC": "MU",
+    "ADVANCED MICRO DEVICES INC": "AMD",
+    "TAIWAN SEMICONDUCTOR MANUFACTURING CO LTD": "TSM",
+    "TAIWAN SEMICONDUCTOR MFG CO LTD": "TSM",
+    "APPLIED MATERIALS INC": "AMAT",
+    "KLA CORP": "KLAC",
+    "ANALOG DEVICES INC": "ADI",
+    "INTEL CORP": "INTC",
+    "TEXAS INSTRUMENTS INC": "TXN",
+    "QUALCOMM INC": "QCOM",
+    "ARM HOLDINGS PLC": "ARM",
+    "ARM HOLDINGS PLC ADR": "ARM",
+    "MICROCHIP TECHNOLOGY INC": "MCHP",
+    "SYNOPSYS INC": "SNPS",
+    "CADENCE DESIGN SYSTEMS INC": "CDNS",
+    "ENTEGRIS INC": "ENTG",
+    "ALLEGRO MICROSYSTEMS INC": "ALGM",
+    "SKYWORKS SOLUTIONS INC": "SWKS",
+    "QORVO INC": "QRVO",
+    "ASE TECHNOLOGY HOLDING CO LTD": "ASX",
+    "UNITED MICROELECTRONICS CORP": "UMC",
+    "TOWER SEMICONDUCTOR LTD": "TSEM",
+    "AMKOR TECHNOLOGY INC": "AMKR",
+    "POWER INTEGRATIONS INC": "POWI",
+    "RAMBUS INC": "RMBS",
+    "CIRRUS LOGIC INC": "CRUS",
+    "SILICON LABORATORIES INC": "SLAB",
+    "LATTICE SEMICONDUCTOR CORP": "LSCC",
+    "WOLFSPEED INC": "WOLF",
+    "FORMFACTOR INC": "FORM",
+    "ONTO INNOVATION INC": "ONTO",
+    "AXCELIS TECHNOLOGIES INC": "ACLS",
+    "ASTERA LABS INC": "ALAB",
+    "CREDO TECHNOLOGY GROUP HOLDING LTD": "CRDO",
+    "MACOM TECHNOLOGY SOLUTIONS HOLDINGS INC": "MTSI",
+    "DIODES INC": "DIOD",
+    "NAVITAS SEMICONDUCTOR CORP": "NVTS",
+    "SITIME CORP": "SITM",
+    "PHOTRONICS INC": "PLAB",
+    "VEECO INSTRUMENTS INC": "VECO",
+    "ULTRA CLEAN HOLDINGS INC": "UCTT",
+    "IMPINJ INC": "PI",
+    "INDIE SEMICONDUCTOR INC": "INDI",
+    "ICHOR HOLDINGS LTD": "ICHR",
+    "MKS INSTRUMENTS INC": "MKSI",
+    "RENESAS ELECTRONICS CORP": "6723.T",
+    "MEDIATEK INC": "2454.TW",
+    "ARISTA NETWORKS INC": "ANET",
+    "INTERNATIONAL BUSINESS MACHINES CORP": "IBM",
+}
+
 FALLBACK_HOLDINGS: Dict[str, float] = {
     "NVDA": 0.2507,
     "AVGO": 0.1294,
@@ -45,6 +124,7 @@ FALLBACK_HOLDINGS: Dict[str, float] = {
 holdings_cache: Dict[str, float] = {}
 holdings_source: str = "uninitialized"
 holdings_timestamp: Optional[float] = None
+holdings_metadata: dict = {}
 
 price_cache: Dict[str, Tuple[float, float]] = {}   # ticker → (prev_close, current)
 price_cache_ts: float = 0.0
@@ -182,44 +262,239 @@ async def fetch_yahoo_holdings() -> Dict[str, float]:
     return top10
 
 
-async def load_holdings() -> Tuple[Dict[str, float], str]:
+# ══════════════════════════════════════════════════════════════════════════════
+# SEC N-PORT FETCHER (full holdings, quarterly)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _name_to_ticker(name: str) -> Optional[str]:
+    """Map a security name (from N-PORT) to a ticker. Returns None if no match."""
+    if not name:
+        return None
+    upper = name.strip().upper()
+    # Strip trailing legal suffixes that vary across filings
+    for suffix in [" - CLASS A", " CLASS A", " ADR", " - ADR", " SPONSORED"]:
+        if upper.endswith(suffix):
+            upper = upper[:-len(suffix)].strip()
+
+    # Direct match
+    if upper in NAME_TO_TICKER:
+        return NAME_TO_TICKER[upper]
+
+    # Bidirectional substring match (handles minor wording differences)
+    for known_name, ticker in NAME_TO_TICKER.items():
+        if known_name in upper or upper in known_name:
+            return ticker
+
+    # Token overlap match: if the first 2 significant words match, accept it
+    upper_tokens = [t for t in upper.split() if len(t) > 2]
+    for known_name, ticker in NAME_TO_TICKER.items():
+        known_tokens = [t for t in known_name.split() if len(t) > 2]
+        if len(upper_tokens) >= 2 and len(known_tokens) >= 2:
+            if upper_tokens[:2] == known_tokens[:2]:
+                return ticker
+    return None
+
+
+async def fetch_sec_nport_holdings() -> Tuple[Dict[str, float], dict]:
+    """
+    Fetch FSELX's full holdings list from the most recent SEC N-PORT-P filing.
+    Returns ({ticker: weight_decimal}, metadata_dict).
+
+    Strategy:
+      1. Use EDGAR full-text search to locate the most recent NPORT-P
+         filing for "Fidelity Select Semiconductors".
+      2. Fetch the primary_doc.xml from EDGAR archives.
+      3. Parse <invstOrSec> entries → name, CUSIP, pctVal.
+      4. Map each name to a ticker via NAME_TO_TICKER + fuzzy matching.
+    """
+    headers = {
+        "User-Agent": SEC_USER_AGENT,
+        "Accept": "application/json",
+        "Host": "efts.sec.gov",
+    }
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # 1. Search EDGAR full-text for FSELX's recent N-PORT-P filings
+        params = {"q": FSELX_SEARCH_Q, "forms": "NPORT-P"}
+        resp = await client.get(EDGAR_SEARCH, params=params, headers=headers)
+        resp.raise_for_status()
+        search_data = resp.json()
+
+        hits = search_data.get("hits", {}).get("hits", [])
+        if not hits:
+            raise ValueError("No N-PORT-P filings found in EDGAR")
+
+        latest = hits[0]
+        src = latest.get("_source", {})
+        accession = src.get("adsh") or latest.get("_id", "").split(":")[0]
+        ciks      = src.get("ciks", [])
+        file_date = src.get("file_date") or src.get("period_of_report", "unknown")
+
+        if not accession or not ciks:
+            raise ValueError("EDGAR result missing accession/CIK")
+
+        cik_int = int(ciks[0])
+        accession_clean = accession.replace("-", "")
+
+        # 2. Fetch the primary document (the actual portfolio XML)
+        doc_url = f"{SEC_ARCHIVES}/{cik_int}/{accession_clean}/primary_doc.xml"
+        doc_headers = {"User-Agent": SEC_USER_AGENT, "Accept": "application/xml"}
+        doc_resp = await client.get(doc_url, headers=doc_headers)
+        doc_resp.raise_for_status()
+        xml_content = doc_resp.text
+
+    # 3. Parse XML — N-PORT uses <invstOrSec> entries with <title> and <pctVal>
+    soup = BeautifulSoup(xml_content, "lxml-xml")
+
+    holdings: Dict[str, float] = {}
+    unmapped: List[Tuple[str, float]] = []
+    total_pct_mapped = 0.0
+    total_pct_seen   = 0.0
+
+    for sec in soup.find_all("invstOrSec"):
+        title_el = sec.find("title")
+        pct_el   = sec.find("pctVal")
+        if not title_el or not pct_el:
+            continue
+
+        name = title_el.get_text(strip=True)
+        try:
+            pct = float(pct_el.get_text(strip=True))
+        except ValueError:
+            continue
+
+        total_pct_seen += pct
+
+        ticker = _name_to_ticker(name)
+        if ticker:
+            # Sum if multiple share classes resolve to same ticker
+            holdings[ticker] = holdings.get(ticker, 0.0) + pct / 100.0
+            total_pct_mapped += pct
+        else:
+            unmapped.append((name, pct))
+
+    if len(holdings) < 5:
+        raise ValueError(
+            f"Only {len(holdings)} holdings mapped from N-PORT (saw {len(unmapped)} unmapped)"
+        )
+
+    metadata = {
+        "filing_date": file_date,
+        "accession": accession,
+        "total_holdings_in_filing": int(len(holdings) + len(unmapped)),
+        "mapped_count": len(holdings),
+        "unmapped_count": len(unmapped),
+        "coverage_pct": round(total_pct_mapped, 2),
+        "filing_total_pct": round(total_pct_seen, 2),
+        "top_unmapped": [{"name": n, "pct": p}
+                         for n, p in sorted(unmapped, key=lambda x: -x[1])[:5]],
+    }
+
+    log.info("✅ N-PORT scrape: %d/%d holdings mapped, %.1f%% coverage, filed %s",
+             len(holdings), len(holdings) + len(unmapped),
+             total_pct_mapped, file_date)
+
+    return holdings, metadata
+
+
+async def fetch_blended_holdings() -> Tuple[Dict[str, float], dict]:
+    """
+    Combine N-PORT (full holdings list) with current Fidelity top-10 weights.
+
+    This produces the most accurate holdings estimate available:
+      • N-PORT contributes the long tail (positions 11+) which Fidelity's
+        marketing page omits — typically 25-30% of the portfolio.
+      • Fidelity's current top-10 weights override the (~3 month older)
+        N-PORT weights for the largest positions, which change most.
+      • Final weights are renormalized so they sum to 1.0.
+    """
+    nport, meta = await fetch_sec_nport_holdings()
+
+    current_top10: Dict[str, float] = {}
+    try:
+        current_top10 = await fetch_fidelity_holdings()
+    except Exception as e:
+        log.warning("Blend: Fidelity top-10 fetch failed (%s) — using N-PORT alone", e)
+
+    blended = dict(nport)
+    overridden = []
+    if current_top10:
+        for ticker, weight in current_top10.items():
+            if ticker in blended:
+                overridden.append(ticker)
+            blended[ticker] = weight  # add or override
+
+    # Renormalize so weights sum to 1.0
+    total = sum(blended.values())
+    if total > 0:
+        blended = {k: v / total for k, v in blended.items()}
+
+    meta = {
+        **meta,
+        "blended_with_fidelity_top10": bool(current_top10),
+        "weights_overridden": overridden,
+        "total_holdings_after_blend": len(blended),
+    }
+    return blended, meta
+
+
+async def load_holdings() -> Tuple[Dict[str, float], str, dict]:
     """
     Try live sources in order; fall back to hardcoded data.
-    Returns (holdings_dict, source_label).
+    Returns (holdings_dict, source_label, metadata_dict).
+    Holdings are capped at top MAX_HOLDINGS by weight for performance.
     """
-    # 1. Fidelity
+    def _cap(h: Dict[str, float]) -> Dict[str, float]:
+        if len(h) <= MAX_HOLDINGS:
+            return h
+        return dict(sorted(h.items(), key=lambda x: x[1], reverse=True)[:MAX_HOLDINGS])
+
+    # 1. Blended (SEC N-PORT full list + current Fidelity top-10) — most accurate
+    try:
+        h, meta = await fetch_blended_holdings()
+        label = (
+            f"SEC N-PORT (filed {meta.get('filing_date', '?')}) + Fidelity top-10"
+            if meta.get("blended_with_fidelity_top10")
+            else f"SEC N-PORT (filed {meta.get('filing_date', '?')})"
+        )
+        return _cap(h), label, meta
+    except Exception as e:
+        log.warning("Blended/N-PORT source failed: %s", e)
+
+    # 2. Fidelity alone (top-10, current)
     try:
         h = await fetch_fidelity_holdings()
-        return h, "Fidelity Investments (live)"
+        return _cap(h), "Fidelity Investments (live, top-10 only)", {}
     except Exception as e:
         log.warning("Fidelity fetch failed: %s", e)
 
-    # 2. Yahoo Finance
+    # 3. Yahoo Finance (top-10, current)
     try:
         h = await fetch_yahoo_holdings()
-        return h, "Yahoo Finance (live)"
+        return _cap(h), "Yahoo Finance (live, top-10 only)", {}
     except Exception as e:
         log.warning("Yahoo Finance fetch failed: %s", e)
 
-    # 3. Hardcoded fallback
-    log.warning("All live sources failed — using hardcoded fallback holdings")
-    return FALLBACK_HOLDINGS.copy(), "Fallback (hardcoded — live sources unavailable)"
+    # 4. Hardcoded fallback
+    log.warning("All live sources failed — using hardcoded fallback")
+    return FALLBACK_HOLDINGS.copy(), "Fallback (hardcoded — live sources unavailable)", {}
 
 
 async def refresh_holdings_if_needed():
     """Refresh holdings cache if stale or empty."""
-    global holdings_cache, holdings_source, holdings_timestamp
+    global holdings_cache, holdings_source, holdings_timestamp, holdings_metadata
 
     now = time.time()
     if holdings_timestamp and (now - holdings_timestamp) < CACHE_TTL_HOURS * 3600:
         return  # still fresh
 
     log.info("Refreshing FSELX holdings cache…")
-    h, src = await load_holdings()
-    holdings_cache = h
-    holdings_source = src
+    h, src, meta = await load_holdings()
+    holdings_cache    = h
+    holdings_source   = src
+    holdings_metadata = meta
     holdings_timestamp = now
-    log.info("Holdings cached from: %s", src)
+    log.info("Holdings cached: %d positions from %s", len(h), src)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -511,6 +786,7 @@ async def get_holdings():
         "last_updated": ts,
         "holdings": {k: round(v * 100, 2) for k, v in holdings_cache.items()},
         "count": len(holdings_cache),
+        "metadata": holdings_metadata,
     })
 
 
@@ -595,6 +871,9 @@ async def estimate(investment: float = Query(..., gt=0, description="Investment 
         "shares": round(shares, 4),
         "holdings_source": holdings_source,
         "holdings_last_updated": ts,
+        "holdings_count": len(holdings_cache),
+        "holdings_coverage_pct": holdings_metadata.get("coverage_pct"),
+        "nport_filing_date": holdings_metadata.get("filing_date"),
         "as_of": datetime.now(timezone.utc).isoformat(),
         "holdings_detail": details,
     })
@@ -963,7 +1242,7 @@ td.down { color: var(--red); }
     <!-- Holdings table -->
     <div class="holdings-card">
       <div class="holdings-header">
-        <span class="holdings-title">Top 10 Holdings · Live Weights</span>
+        <span class="holdings-title" id="holdings-title">Holdings · Live Weights</span>
         <span class="holdings-source" id="holdings-source-badge">—</span>
       </div>
       <div class="table-scroll">
@@ -1076,10 +1355,17 @@ function renderResults(d, inv) {
   $('r-prev').textContent   = '$' + fmt(d.prev_nav, 4);
   $('r-shares').textContent = fmt(d.shares, 4);
 
-  // Source badge
+  // Source badge + title
   const src = d.holdings_source || '—';
   $('holdings-source-badge').textContent = src.replace('(live)', '').trim();
   $('holdings-source-badge').title = src;
+
+  const titleEl = $('holdings-title');
+  let title = `Top ${d.holdings_count} Holdings · Live Prices`;
+  if (d.holdings_coverage_pct) {
+    title += ` · ${d.holdings_coverage_pct.toFixed(0)}% coverage`;
+  }
+  titleEl.textContent = title;
 
   // Holdings table
   const tbody = $('holdings-tbody');
@@ -1107,8 +1393,13 @@ function renderResults(d, inv) {
 
   // Timestamp
   const ts = new Date(d.as_of);
-  $('r-timestamp').textContent =
-    `DATA AS OF ${ts.toLocaleDateString()} ${ts.toLocaleTimeString()} · HOLDINGS: ${d.holdings_last_updated ? new Date(d.holdings_last_updated).toLocaleDateString() : '—'}`;
+  let footer = `DATA AS OF ${ts.toLocaleDateString()} ${ts.toLocaleTimeString()}`;
+  if (d.nport_filing_date) {
+    footer += ` · N-PORT FILED ${d.nport_filing_date}`;
+  } else if (d.holdings_last_updated) {
+    footer += ` · HOLDINGS ${new Date(d.holdings_last_updated).toLocaleDateString()}`;
+  }
+  $('r-timestamp').textContent = footer;
 }
 
 // Auto-run on Enter
