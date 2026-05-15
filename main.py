@@ -150,7 +150,7 @@ app.add_middleware(
 
 async def fetch_fidelity_holdings() -> Dict[str, float]:
     """Scrape top 10 holdings from Fidelity's fund page."""
-    url = "https://fundresearch.fidelity.com/mutual-funds/composition/316390590"
+    url = "https://fundresearch.fidelity.com/mutual-funds/composition/316390863"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
